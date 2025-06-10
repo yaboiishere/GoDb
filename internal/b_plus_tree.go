@@ -3,6 +3,9 @@ package internal
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"strings"
 )
 
 const HEADER = 4
@@ -126,22 +129,6 @@ func nodeLookupLE(node BNode, key []byte) uint16 {
 	return found
 }
 
-func leafInsert(
-	new BNode, old BNode, index uint16, key []byte, value []byte) {
-	new.setHeader(BNodeLeaf, old.nKeys()+1)
-	nodeAppendRange(new, old, 0, 0, index)
-	nodeAppendKV(new, index, 0, key, value)
-	nodeAppendRange(new, old, index+1, index, old.nKeys()-index)
-}
-
-func leafUpdate(
-	new BNode, old BNode, index uint16, key []byte, value []byte) {
-	new.setHeader(BNodeLeaf, old.nKeys())
-	nodeAppendRange(new, old, 0, 0, index)
-	nodeAppendKV(new, index, 0, key, value)
-	nodeAppendRange(new, old, index+1, index+1, old.nKeys()-(index+1))
-}
-
 func nodeAppendKV(new BNode, index uint16, ptr uint64, key, value []byte) {
 	//ptrs
 	new.setPtr(index, ptr)
@@ -152,7 +139,7 @@ func nodeAppendKV(new BNode, index uint16, ptr uint64, key, value []byte) {
 	binary.LittleEndian.PutUint16(new[pos+0:], kLen)
 	binary.LittleEndian.PutUint16(new[pos+2:], vLen)
 	copy(new[pos+4:], key)
-	copy(new[pos+kLen:], value)
+	copy(new[pos+4+kLen:], value)
 	// the offset of the next key
 	new.setOffset(index+1, new.getOffset(index)+4+kLen+vLen)
 }
@@ -203,6 +190,12 @@ func nodeReplaceKidN(tree *BTree, new, old BNode, index uint16, kids ...BNode) {
 		nodeAppendKV(new, index+uint16(i), tree.new(node), node.getKey(0), nil)
 	}
 	nodeAppendRange(new, old, index+inc, index+1, old.nKeys()-(index+1))
+}
+func nodeReplace2Kid(new, old BNode, index uint16, ptr uint64, key []byte) {
+	new.setHeader(BNodeNode, old.nKeys()-1)
+	nodeAppendRange(new, old, 0, 0, index)
+	nodeAppendKV(new, index, ptr, key, nil)
+	nodeAppendRange(new, old, index, index+2, old.nKeys()-(index+1))
 }
 
 //func nodeSplit2(left, right, old BNode) {
@@ -270,13 +263,70 @@ func nodeSplit3(old BNode) (uint16, [3]BNode) {
 		left = left[:BtreePageSize]
 		return 2, [3]BNode{left, right}
 	}
-	leftleft := BNode(make([]byte, BtreePageSize))
+	leftLeft := BNode(make([]byte, BtreePageSize))
 	middle := BNode(make([]byte, BtreePageSize))
-	nodeSplit2(leftleft, middle, left)
-	if leftleft.nBytes() > BtreePageSize {
+	nodeSplit2(leftLeft, middle, left)
+	if leftLeft.nBytes() > BtreePageSize {
 		panic("nodeSplit3: Unable to split into third node!!!")
 	}
-	return 3, [3]BNode{leftleft, middle, left}
+	return 3, [3]BNode{leftLeft, middle, left}
+}
+func nodeInsert(tree *BTree, new, node BNode, index uint16, key, value []byte) {
+	kPtr := node.getPtr(index)
+	// insert into the kid node
+	kNode := treeInsert(tree, tree.get(kPtr), key, value)
+	//split the result
+	nSplit, split := nodeSplit3(kNode)
+	tree.del(kPtr)
+	// update the child links
+	nodeReplaceKidN(tree, new, node, index, split[:nSplit]...)
+}
+
+func nodeDelete(tree *BTree, node BNode, index uint16, key []byte) BNode {
+	kPtr := node.getPtr(index)
+	updated := treeDelete(tree, tree.get(kPtr), key)
+	if len(updated) == 0 {
+		return BNode{} //not found
+	}
+
+	tree.del(kPtr)
+
+	//check for merging
+	newNode := BNode(make([]byte, BtreePageSize))
+	mergeDir, sibling := shouldMerge(tree, node, index, updated)
+	switch {
+	case mergeDir < 0: //left
+		merged := BNode(make([]byte, BtreePageSize))
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getPtr(index - 1))
+		nodeReplace2Kid(newNode, node, index-1, tree.new(merged), merged.getKey(0))
+	case mergeDir > 0: //right
+		merged := BNode(make([]byte, BtreePageSize))
+		nodeMerge(merged, updated, sibling)
+		tree.del(node.getPtr(index + 1))
+		nodeReplace2Kid(newNode, node, index, tree.new(merged), merged.getKey(0))
+	case updated.nKeys() == 0:
+		if !(node.nKeys() == 1 && index == 0) {
+			panic("node has 1 empty child, but no sibling")
+		}
+		newNode.setHeader(BNodeNode, 0)
+	case updated.nKeys() > 0:
+		nodeReplaceKidN(tree, newNode, node, index, updated)
+	}
+
+	return newNode
+}
+
+func nodeMerge(new, left, right BNode) {
+	if left.nBytes()+right.nBytes()-HEADER > BtreePageSize {
+		panic("nodeMerge: Can't merge nodes, sum of sizes too big")
+	}
+	lNKeys := left.nKeys()
+	rNKeys := right.nKeys()
+	new.setHeader(left.bType(), lNKeys+rNKeys)
+
+	nodeAppendRange(new, left, 0, 0, lNKeys)
+	nodeAppendRange(new, right, lNKeys, 0, rNKeys)
 }
 
 // insert a KV into a node, the result might split be split.
@@ -305,15 +355,123 @@ func treeInsert(tree *BTree, node BNode, key, value []byte) BNode {
 	return newNode
 }
 
-func nodeInsert(tree *BTree, new, node BNode, index uint16, key, value []byte) {
-	kPtr := node.getPtr(index)
-	// insert into the kid node
-	kNode := treeInsert(tree, tree.get(kPtr), key, value)
-	//split the result
-	nSplit, split := nodeSplit3(kNode)
-	tree.del(kPtr)
-	// update the child links
-	nodeReplaceKidN(tree, new, node, index, split[:nSplit]...)
+func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+	index := nodeLookupLE(node, key)
+	switch node.bType() {
+	case BNodeLeaf:
+		if bytes.Equal(key, node.getKey(index)) {
+			newNode := BNode(make([]byte, BtreePageSize))
+			leafDelete(newNode, node, index)
+			return newNode
+		} else {
+			return BNode{}
+		}
+	case BNodeNode:
+		return nodeDelete(tree, node, index, key)
+	default:
+		panic("bad node")
+	}
+}
+
+func leafInsert(
+	new, old BNode, index uint16, key []byte, value []byte) {
+	new.setHeader(BNodeLeaf, old.nKeys()+1)
+	nodeAppendRange(new, old, 0, 0, index)
+	nodeAppendKV(new, index, 0, key, value)
+	nodeAppendRange(new, old, index+1, index, old.nKeys()-index)
+}
+
+func leafUpdate(
+	new BNode, old BNode, index uint16, key []byte, value []byte) {
+	new.setHeader(BNodeLeaf, old.nKeys())
+	nodeAppendRange(new, old, 0, 0, index)
+	nodeAppendKV(new, index, 0, key, value)
+	nodeAppendRange(new, old, index+1, index+1, old.nKeys()-(index+1))
+}
+
+func leafDelete(new, old BNode, index uint16) {
+	new.setHeader(BNodeLeaf, old.nKeys()-1)
+	nodeAppendRange(new, old, 0, 0, index)
+	nodeAppendRange(new, old, index, index+1, old.nKeys()-(index+1))
+
+}
+
+func shouldMerge(tree *BTree, node BNode, index uint16, updated BNode) (int, BNode) {
+	if updated.nBytes() > BtreePageSize {
+		return 0, BNode{}
+	}
+
+	if index > 0 {
+		sibling := BNode(tree.get(node.getPtr(index - 1)))
+		merged := sibling.nBytes() + updated.nBytes() - HEADER
+		if merged <= BtreePageSize {
+			return -1, sibling //left
+		}
+	}
+	if index+1 < node.nKeys() {
+		sibling := BNode(tree.get(node.getPtr(index + 1)))
+		merged := sibling.nBytes() + updated.nBytes() - HEADER
+		if merged <= BtreePageSize {
+			return +1, sibling //right
+		}
+	}
+
+	return 0, BNode{}
+}
+
+func (tree *BTree) Insert(key, value []byte) error {
+	// check the key and value length against the node format
+	if err := checkLimit(key, value); err != nil {
+		return err
+	}
+
+	// create the first node
+	if tree.root == 0 {
+		root := BNode(make([]byte, BtreePageSize))
+		root.setHeader(BNodeLeaf, 2)
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, key, value)
+		tree.root = tree.new(root)
+		return nil
+	}
+
+	node := treeInsert(tree, tree.get(tree.root), key, value)
+
+	nSplit, split := nodeSplit3(node)
+	tree.del(tree.root)
+	if nSplit > 1 {
+		root := BNode(make([]byte, BtreePageSize))
+		root.setHeader(BNodeNode, nSplit)
+		for i, kNode := range split[:nSplit] {
+			ptr, key := tree.new(kNode), kNode.getKey(0)
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
+		tree.root = tree.new(root)
+	} else {
+		tree.root = tree.new(split[0])
+	}
+
+	return nil
+}
+
+func (tree *BTree) Delete(key []byte) (bool, error) {
+	if tree.root == 0 {
+		return false, errors.New("Tree is empty")
+	}
+
+	updated := treeDelete(tree, tree.get(tree.root), key)
+
+	if len(updated) == 0 {
+		return false, errors.New("node not found")
+	}
+
+	tree.del(tree.root)
+	if updated.bType() == BNodeNode && updated.nKeys() == 1 {
+		tree.root = updated.getPtr(0)
+	} else {
+		tree.root = tree.new(updated)
+	}
+	return true, nil
 }
 
 func init() {
@@ -322,5 +480,101 @@ func init() {
 	//noinspection GoBoolExpressions
 	if node1max > BtreePageSize {
 		panic("Node size is too big")
+	}
+}
+
+func checkLimit(key, value []byte) error {
+	if len(key) > BtreeMaxKeySize {
+		return errors.New("key is too large")
+	}
+
+	if len(value) > BtreeMaxValSize {
+		return errors.New("value is too large")
+	}
+
+	return nil
+}
+
+func (tree *BTree) String() string {
+	var sb strings.Builder
+	if tree.root == 0 {
+		sb.WriteString("<empty tree>")
+		return sb.String()
+	}
+	tree.stringifyNode(&sb, tree.get(tree.root), 0)
+	return sb.String()
+}
+
+func (tree *BTree) stringifyNode(sb *strings.Builder, node BNode, depth int) {
+	indent := strings.Repeat("  ", depth)
+	kind := node.bType()
+	count := node.nKeys()
+
+	if kind == BNodeLeaf {
+		sb.WriteString(fmt.Sprintf("%sLeaf:\n", indent))
+		for i := uint16(1); i < count; i++ {
+			k := node.getKey(i)
+			v := node.getVal(i)
+			sb.WriteString(fmt.Sprintf("%s  [%s] => [%s]\n", indent, string(k), string(v)))
+		}
+	} else if kind == BNodeNode {
+		sb.WriteString(fmt.Sprintf("%sInternal:\n", indent))
+		for i := uint16(0); i < count; i++ {
+			ptr := node.getPtr(i)
+			key := node.getKey(i)
+			if i > 0 {
+				sb.WriteString(fmt.Sprintf("%s  <key> [%s]\n", indent, string(key)))
+			}
+			child := tree.get(ptr)
+			tree.stringifyNode(sb, child, depth+1)
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf("%sUnknown node type\n", indent))
+	}
+}
+
+type Kv struct {
+	Key   []byte
+	Value []byte
+}
+
+func (kv Kv) String() string {
+	return fmt.Sprintf("{%c: %c}", kv.Key, kv.Value)
+}
+
+func (tree *BTree) ToSlice() []Kv {
+	if tree.root == 0 {
+		return make([]Kv, 0)
+	}
+	var resp []Kv
+	tree.sliceNode(&resp, tree.get(tree.root))
+
+	return resp
+}
+
+func (tree *BTree) sliceNode(resp *[]Kv, node BNode) {
+	kind := node.bType()
+	count := node.nKeys()
+	switch kind {
+	case BNodeLeaf:
+		for i := uint16(1); i < count; i++ {
+			k0 := node.getKey(i)
+			v0 := node.getVal(i)
+			k := make([]byte, len(k0))
+			copy(k, k0)
+			v := make([]byte, len(v0))
+			copy(v, v0)
+			*resp = append(*resp, Kv{k, v})
+		}
+
+	case BNodeNode:
+		for i := uint16(0); i < count; i++ {
+			ptr := node.getPtr(i)
+			child := tree.get(ptr)
+			tree.sliceNode(resp, child)
+		}
+
+	default:
+		panic("Unknown node type")
 	}
 }
