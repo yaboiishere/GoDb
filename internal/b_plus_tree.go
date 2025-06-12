@@ -271,6 +271,14 @@ func nodeSplit3(old BNode) (uint16, [3]BNode) {
 	}
 	return 3, [3]BNode{leftLeft, middle, left}
 }
+
+func nodeGet(tree *BTree, node BNode, index uint16, key []byte) ([]byte, error) {
+	kPtr := node.getPtr(index)
+
+	kNode := BNode(tree.get(kPtr))
+	return treeGet(tree, kNode, key)
+}
+
 func nodeInsert(tree *BTree, new, node BNode, index uint16, key, value []byte) {
 	kPtr := node.getPtr(index)
 	// insert into the kid node
@@ -327,6 +335,24 @@ func nodeMerge(new, left, right BNode) {
 
 	nodeAppendRange(new, left, 0, 0, lNKeys)
 	nodeAppendRange(new, right, lNKeys, 0, rNKeys)
+}
+
+func treeGet(tree *BTree, node BNode, key []byte) ([]byte, error) {
+	index := nodeLookupLE(node, key)
+
+	switch node.bType() {
+	case BNodeLeaf:
+		if bytes.Equal(key, node.getKey(index)) {
+			return node.getVal(index), nil
+		}
+		return nil, errors.New("key not found")
+	case BNodeNode:
+		return nodeGet(tree, node, index, key)
+
+	default:
+		panic("unknown node type")
+	}
+
 }
 
 // insert a KV into a node, the result might split be split.
@@ -417,6 +443,22 @@ func shouldMerge(tree *BTree, node BNode, index uint16, updated BNode) (int, BNo
 	}
 
 	return 0, BNode{}
+}
+
+func (tree *BTree) Get(key []byte) ([]byte, error) {
+	if tree.root == 0 {
+		return nil, errors.New("key not found")
+	}
+
+	root := BNode(tree.get(tree.root))
+
+	return treeGet(tree, root, key)
+
+	//for i := uint16(0); i < root.nKeys(); i++ {
+	//	ptr := root.getPtr(i)
+	//	bNode := BNode(tree.get(ptr))
+	//}
+
 }
 
 func (tree *BTree) Insert(key, value []byte) error {
@@ -533,26 +575,26 @@ func (tree *BTree) stringifyNode(sb *strings.Builder, node BNode, depth int) {
 	}
 }
 
-type Kv struct {
+type kv struct {
 	Key   []byte
 	Value []byte
 }
 
-func (kv Kv) String() string {
+func (kv kv) String() string {
 	return fmt.Sprintf("{%c: %c}", kv.Key, kv.Value)
 }
 
-func (tree *BTree) ToSlice() []Kv {
+func (tree *BTree) ToSlice() []kv {
 	if tree.root == 0 {
-		return make([]Kv, 0)
+		return make([]kv, 0)
 	}
-	var resp []Kv
+	var resp []kv
 	tree.sliceNode(&resp, tree.get(tree.root))
 
 	return resp
 }
 
-func (tree *BTree) sliceNode(resp *[]Kv, node BNode) {
+func (tree *BTree) sliceNode(resp *[]kv, node BNode) {
 	kind := node.bType()
 	count := node.nKeys()
 	switch kind {
@@ -564,7 +606,7 @@ func (tree *BTree) sliceNode(resp *[]Kv, node BNode) {
 			copy(k, k0)
 			v := make([]byte, len(v0))
 			copy(v, v0)
-			*resp = append(*resp, Kv{k, v})
+			*resp = append(*resp, kv{k, v})
 		}
 
 	case BNodeNode:

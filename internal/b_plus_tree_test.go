@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"testing"
 	"unsafe"
 )
@@ -72,8 +71,8 @@ func seed(c *C) {
 	keys := make(map[string]string)
 	for i := 0; i < 100; i++ {
 		for j := 'a'; j <= 'z'; j++ {
-			k := strings.Repeat(string(j), i)
-			keys[k] = strings.Repeat(string(j), 50)
+			k := fmt.Sprintf("key%d%c", i, j)
+			keys[k] = fmt.Sprintf("value%c%d", j, i)
 		}
 	}
 	for k, v := range keys {
@@ -110,32 +109,24 @@ func TestInsertUpdateAndDelete(t *testing.T) {
 		t.Error("dbAsSlice is not unique")
 	}
 
-	counter := 0
-
 	c.add("a", "b")
-	for _, page := range c.pages {
-		for i := uint16(0); i < page.nKeys(); i++ {
-			if string(page.getKey(i)) == "a" {
-				counter++
-				if string(page.getVal(i)) != "b" {
-					t.Error("page is not updated")
-				}
-			}
-		}
+	get, err := c.Get([]byte("a"))
+	if err != nil {
+		return
 	}
-	fmt.Printf("counter: %d\n", counter)
 
-	err := c.del("a")
+	if string(get) != "b" {
+		t.Error("get != \"b\"", string(get))
+	}
+
+	err = c.del("a")
 	if err != nil {
 		t.Error("del failed", err)
 		return
 	}
-	for _, page := range c.pages {
-		for i := uint16(0); i < page.nKeys(); i++ {
-			if string(page.getKey(i)) == "a" {
-				t.Error("page is not deleted")
-			}
-		}
+	get, err = c.Get([]byte("a"))
+	if err == nil {
+		t.Error("the key should not exist")
 	}
 
 }
